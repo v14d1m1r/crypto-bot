@@ -1,0 +1,100 @@
+use std::sync::Arc;
+
+use anyhow::Result;
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{StatusCode, header},
+    routing::get,
+};
+use serde_json::{Value, json};
+use tower_http::cors::{Any, CorsLayer};
+use tracing::info;
+
+use crate::{config::Config, database::Database};
+
+#[derive(Clone)]
+struct ApiState {
+    database: Database,
+    config: Config,
+}
+type SharedState = Arc<ApiState>;
+type ApiResult = Result<Json<Value>, (StatusCode, String)>;
+
+pub async fn serve(database: Database, config: Config) -> Result<()> {
+    let address = config.api_address.clone();
+    let state = Arc::new(ApiState { database, config });
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers([header::CONTENT_TYPE]);
+    let app = Router::new()
+        .route("/api/health", get(|| async { Json(json!({"ok": true})) }))
+        .route("/api/status", get(status))
+        .route("/api/trades", get(trades))
+        .route("/api/fills", get(fills))
+        .route("/api/equity", get(equity))
+        .route("/api/candles", get(candles))
+        .layer(cors)
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(&address).await?;
+    info!(%address, "dashboard API listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn status(State(state): State<SharedState>) -> ApiResult {
+    let status = state.database.status().await.map_err(internal)?;
+    let environment = state.config.mode.to_string();
+    let risk = state
+        .database
+        .risk_status(&environment, &state.config.symbol)
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "bot": status,
+        "risk": risk,
+        "config": { "symbol": state.config.symbol, "interval": state.config.interval,
+            "fast_ema": state.config.fast_ema, "slow_ema": state.config.slow_ema,
+            "starting_cash": state.config.starting_cash, "mode": environment,
+            "max_daily_loss_quote": state.config.max_daily_loss_quote,
+            "max_entries_per_day": state.config.max_entries_per_day,
+            "max_consecutive_losses": state.config.max_consecutive_losses }
+    })))
+}
+
+async fn trades(State(state): State<SharedState>) -> ApiResult {
+    Ok(Json(json!(
+        state.database.recent_trades(50).await.map_err(internal)?
+    )))
+}
+
+async fn fills(State(state): State<SharedState>) -> ApiResult {
+    Ok(Json(json!(
+        state
+            .database
+            .recent_exchange_fills(100)
+            .await
+            .map_err(internal)?
+    )))
+}
+
+async fn equity(State(state): State<SharedState>) -> ApiResult {
+    Ok(Json(json!(
+        state.database.recent_equity(200).await.map_err(internal)?
+    )))
+}
+
+async fn candles(State(state): State<SharedState>) -> ApiResult {
+    Ok(Json(json!(
+        state
+            .database
+            .recent_candles(&state.config.symbol, &state.config.interval, 200)
+            .await
+            .map_err(internal)?
+    )))
+}
+
+fn internal(error: anyhow::Error) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}

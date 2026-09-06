@@ -1212,6 +1212,7 @@ impl TestnetTrader {
         signal: Option<Signal>,
     ) -> Result<()> {
         let price = Decimal::from_f64_retain(candle.close).context("invalid candle price")?;
+        let stale_entry = config.candle_is_stale(candle.close_time, now_ms()?);
         let exit_reason = self.entry_price.and_then(|entry| {
             let change = price / entry - Decimal::ONE;
             if self.protective_list_id.is_none()
@@ -1229,30 +1230,39 @@ impl TestnetTrader {
             }
         });
         let order_and_reason = if self.tracked_quantity.is_zero() && signal == Some(Signal::Buy) {
-            let risk = self
-                .refresh_risk(config, database, candle.close_time)
-                .await?;
-            if risk.halted {
-                info!(
-                    reason = risk.reason.as_deref().unwrap_or("risk limit reached"),
-                    "Testnet buy signal blocked by risk circuit breaker"
+            if stale_entry {
+                warn!(
+                    close_time = candle.close_time,
+                    stale_after_seconds = config.stale_data_seconds,
+                    "stale Testnet candle cannot open a new position"
                 );
                 None
             } else {
-                let account = self.client.account().await?;
-                let fraction = Decimal::from_f64_retain(config.position_fraction)
-                    .context("invalid position fraction")?;
-                let cap = Decimal::from_f64_retain(config.max_order_quote)
-                    .context("invalid max order quote")?;
-                let quote = self
-                    .rules
-                    .round_quote((account.free(&self.rules.quote_asset) * fraction).min(cap));
-                Some((
-                    self.client
-                        .market_buy(&config.symbol, quote, &self.rules)
-                        .await?,
-                    "EMA crossover",
-                ))
+                let risk = self
+                    .refresh_risk(config, database, candle.close_time)
+                    .await?;
+                if risk.halted {
+                    info!(
+                        reason = risk.reason.as_deref().unwrap_or("risk limit reached"),
+                        "Testnet buy signal blocked by risk circuit breaker"
+                    );
+                    None
+                } else {
+                    let account = self.client.account().await?;
+                    let fraction = Decimal::from_f64_retain(config.position_fraction)
+                        .context("invalid position fraction")?;
+                    let cap = Decimal::from_f64_retain(config.max_order_quote)
+                        .context("invalid max order quote")?;
+                    let quote = self
+                        .rules
+                        .round_quote((account.free(&self.rules.quote_asset) * fraction).min(cap));
+                    Some((
+                        self.client
+                            .market_buy(&config.symbol, quote, &self.rules)
+                            .await?,
+                        "EMA crossover",
+                    ))
+                }
             }
         } else if let Some(reason) = exit_reason {
             self.cancel_protection(config).await?;
@@ -1544,7 +1554,7 @@ pub async fn run_stream(
     trader.notify_recovered();
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = crate::shutdown::signal() => {
                 let _ = writer.close().await;
                 let _ = user_writer.close().await;
                 return Ok(StreamEnd::Shutdown);

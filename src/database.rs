@@ -1,6 +1,11 @@
+use std::{str::FromStr, time::Duration};
+
 use anyhow::{Context, Result};
 use serde::Serialize;
-use sqlx::{FromRow, SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{
+    FromRow, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+};
 
 use crate::{
     binance::Candle,
@@ -85,9 +90,15 @@ pub struct RiskLimits {
 
 impl Database {
     pub async fn connect(url: &str) -> Result<Self> {
+        let options = SqliteConnectOptions::from_str(url)
+            .with_context(|| format!("invalid SQLite database URL: {url}"))?
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(url)
+            .connect_with(options)
             .await
             .with_context(|| format!("failed to open SQLite database at {url}"))?;
         let database = Self { pool };
@@ -353,11 +364,36 @@ impl Database {
         rows.reverse();
         Ok(rows)
     }
+
+    pub async fn latest_candle_time(&self, symbol: &str, interval: &str) -> Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar("SELECT MAX(close_time) FROM candles WHERE symbol=? AND interval=?")
+                .bind(symbol)
+                .bind(interval)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sqlite_connections_enable_safety_pragmas() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        assert_eq!(busy_timeout, 5_000);
+        assert_eq!(foreign_keys, 1);
+    }
 
     #[tokio::test]
     async fn exchange_trade_summary_is_idempotent_by_order_id() {

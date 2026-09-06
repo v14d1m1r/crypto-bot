@@ -40,6 +40,8 @@ npm.cmd run dev
 
 Open `http://localhost:3000`. The Rust API listens on `http://127.0.0.1:3001`. Stop either process with `Ctrl+C`.
 
+For a hardened Binance Spot Testnet deployment on Linode, including `systemd`, private API access, backups, and recovery, follow [deploy/README.md](deploy/README.md).
+
 SQLite data is stored in `crypto_bot.db`. Restarting the bot restores paper cash and an open position. Delete or rename that file only when you intentionally want a fresh paper account.
 
 ## Backtest

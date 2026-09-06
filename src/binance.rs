@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     alerts::TelegramAlerter, config::Config, database::Database, strategy::EmaCrossover,
@@ -125,7 +125,7 @@ pub async fn run_stream(
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = crate::shutdown::signal() => {
                 let _ = writer.close().await;
                 return Ok(StreamEnd::Shutdown);
             }
@@ -134,6 +134,19 @@ pub async fn run_stream(
                     if let Some(candle) = parse_closed_candle(&text)? {
                         let price = candle.close;
                         let signal = strategy.on_close(price);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_millis() as i64;
+                        let stale_entry = config.candle_is_stale(candle.close_time, now)
+                            && signal == Some(crate::strategy::Signal::Buy)
+                            && trader.state().position_quantity.is_none();
+                        let signal = if stale_entry {
+                            warn!(close_time = candle.close_time, stale_after_seconds = config.stale_data_seconds,
+                                "stale paper candle cannot open a new position");
+                            None
+                        } else {
+                            signal
+                        };
                         let (fast, slow) = strategy.averages().unwrap_or_default();
                         debug!(price, fast_ema = fast, slow_ema = slow, close_time = candle.close_time, "candle closed");
                         let trade = trader.on_candle(price, signal, candle.close_time);

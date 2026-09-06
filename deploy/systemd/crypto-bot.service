@@ -1,0 +1,43 @@
+[Unit]
+Description=CRUX Binance Spot Testnet bot
+Wants=network-online.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=crypto-bot
+Group=crypto-bot
+WorkingDirectory=/var/lib/crypto-bot
+EnvironmentFile=/etc/crypto-bot/crypto-bot.env
+Environment=RUST_LOG=crypto_bot=info
+ExecStart=/opt/crypto-bot/bin/crypto-bot bot
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/crypto-bot
+
+[Install]
+WantedBy=multi-user.target

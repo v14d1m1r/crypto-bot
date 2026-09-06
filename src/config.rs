@@ -44,6 +44,8 @@ pub struct Config {
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
     pub telegram_api_base: String,
+    pub stale_data_seconds: i64,
+    pub cors_origin: String,
 }
 
 impl Config {
@@ -68,12 +70,14 @@ impl Config {
                 "sqlite://crypto_bot_testnet.db?mode=rwc",
             ),
         };
+        let interval = env::var("BOT_INTERVAL").unwrap_or_else(|_| "1m".into());
+        let default_stale_data_seconds = interval_seconds(&interval)? * 3 + 30;
         let config = Self {
             mode,
             symbol: env::var("BOT_SYMBOL")
                 .unwrap_or_else(|_| "BTCUSDT".into())
                 .to_uppercase(),
-            interval: env::var("BOT_INTERVAL").unwrap_or_else(|_| "1m".into()),
+            interval,
             fast_ema: env_value("BOT_FAST_EMA", 20)?,
             slow_ema: env_value("BOT_SLOW_EMA", 50)?,
             starting_cash: env_value("BOT_STARTING_CASH", 10_000.0)?,
@@ -104,6 +108,9 @@ impl Config {
                 .filter(|value| !value.trim().is_empty()),
             telegram_api_base: env::var("TELEGRAM_API_BASE")
                 .unwrap_or_else(|_| "https://api.telegram.org".into()),
+            stale_data_seconds: env_value("BOT_STALE_DATA_SECONDS", default_stale_data_seconds)?,
+            cors_origin: env::var("BOT_CORS_ORIGIN")
+                .unwrap_or_else(|_| "http://localhost:3000".into()),
         };
         config.validate()?;
         Ok(config)
@@ -119,6 +126,15 @@ impl Config {
         ];
         if !INTERVALS.contains(&self.interval.as_str()) {
             bail!("unsupported BOT_INTERVAL: {}", self.interval);
+        }
+        if self.stale_data_seconds <= 0 {
+            bail!("BOT_STALE_DATA_SECONDS must be positive");
+        }
+        if self.cors_origin.contains('*')
+            || (!self.cors_origin.starts_with("http://")
+                && !self.cors_origin.starts_with("https://"))
+        {
+            bail!("BOT_CORS_ORIGIN must be one explicit HTTP(S) origin");
         }
         if self.fast_ema == 0 || self.fast_ema >= self.slow_ema || self.slow_ema > 1_000 {
             bail!("EMA windows must satisfy 0 < BOT_FAST_EMA < BOT_SLOW_EMA <= 1000");
@@ -220,8 +236,33 @@ impl Config {
             telegram_bot_token: None,
             telegram_chat_id: None,
             telegram_api_base: "https://api.telegram.org".into(),
+            stale_data_seconds: 210,
+            cors_origin: "http://localhost:3000".into(),
         }
     }
+
+    pub fn candle_is_stale(&self, close_time_ms: i64, now_ms: i64) -> bool {
+        now_ms.saturating_sub(close_time_ms) > self.stale_data_seconds.saturating_mul(1_000)
+    }
+}
+
+fn interval_seconds(interval: &str) -> Result<i64> {
+    if interval == "1M" {
+        return Ok(30 * 24 * 60 * 60);
+    }
+    let (number, unit) = interval.split_at(interval.len().saturating_sub(1));
+    let number = number
+        .parse::<i64>()
+        .with_context(|| format!("invalid BOT_INTERVAL '{interval}'"))?;
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        "w" => 7 * 24 * 60 * 60,
+        _ => bail!("invalid BOT_INTERVAL '{interval}'"),
+    };
+    Ok(number * multiplier)
 }
 
 fn endpoint_env(mode: ExecutionMode, kind: &str, default: &str) -> String {
@@ -270,4 +311,24 @@ fn validate_fraction(name: &str, value: f64, allow_zero: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_to_seconds_supports_configured_units() {
+        assert_eq!(interval_seconds("1m").unwrap(), 60);
+        assert_eq!(interval_seconds("5m").unwrap(), 300);
+        assert_eq!(interval_seconds("2h").unwrap(), 7_200);
+        assert_eq!(interval_seconds("1M").unwrap(), 2_592_000);
+    }
+
+    #[test]
+    fn stale_candle_boundary_is_deterministic() {
+        let config = Config::default_for_test();
+        assert!(!config.candle_is_stale(1_000, 211_000));
+        assert!(config.candle_is_stale(1_000, 211_001));
+    }
 }

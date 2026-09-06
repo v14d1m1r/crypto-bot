@@ -4,13 +4,16 @@ mod backtest;
 mod binance;
 mod config;
 mod database;
+#[cfg(test)]
+mod deployment_tests;
+mod shutdown;
 mod strategy;
 mod testnet;
 mod trader;
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use config::{Config, ExecutionMode};
 use database::Database;
 use strategy::EmaCrossover;
@@ -89,11 +92,15 @@ async fn run_paper_bot(config: Config) -> Result<()> {
     {
         warn!(%error, "Telegram paper lifecycle alert delivery failed");
     }
-    let api_task = tokio::spawn(api::serve(database.clone(), config.clone()));
+    let mut api_task = tokio::spawn(api::serve(database.clone(), config.clone()));
     let mut last_connection_alert_ms = None;
 
     loop {
-        match binance::run_stream(&config, &mut strategy, &mut trader, &database, &alerts).await {
+        let stream_result = tokio::select! {
+            result = binance::run_stream(&config, &mut strategy, &mut trader, &database, &alerts) => result,
+            result = &mut api_task => return api_stopped(result),
+        };
+        match stream_result {
             Ok(binance::StreamEnd::Shutdown) => break,
             Ok(binance::StreamEnd::Disconnected) => {
                 warn!("market stream disconnected; reconnecting in 5 seconds");
@@ -164,9 +171,13 @@ async fn run_testnet_bot(config: Config) -> Result<()> {
             config.symbol, config.interval, config.fast_ema, config.slow_ema
         ))
         .await;
-    let api_task = tokio::spawn(api::serve(database.clone(), config.clone()));
+    let mut api_task = tokio::spawn(api::serve(database.clone(), config.clone()));
     loop {
-        match testnet::run_stream(&config, &mut strategy, &mut trader, &database).await {
+        let stream_result = tokio::select! {
+            result = testnet::run_stream(&config, &mut strategy, &mut trader, &database) => result,
+            result = &mut api_task => return api_stopped(result),
+        };
+        match stream_result {
             Ok(binance::StreamEnd::Shutdown) => break,
             Ok(binance::StreamEnd::Disconnected) => {
                 warn!("Testnet stream disconnected; reconnecting in 5 seconds");
@@ -188,6 +199,14 @@ async fn run_testnet_bot(config: Config) -> Result<()> {
     trader.send_alert("CRUX TESTNET STOPPED").await;
     info!("Binance Spot Testnet bot stopped");
     Ok(())
+}
+
+fn api_stopped(result: Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
+    match result {
+        Ok(Ok(())) => Err(anyhow!("dashboard API stopped unexpectedly")),
+        Ok(Err(error)) => Err(error).context("dashboard API failed"),
+        Err(error) => Err(error).context("dashboard API task failed"),
+    }
 }
 
 async fn run_backtest(config: Config) -> Result<()> {

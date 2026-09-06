@@ -4,11 +4,11 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderValue, Method, StatusCode, header},
     routing::get,
 };
 use serde_json::{Value, json};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::{config::Config, database::Database};
@@ -23,13 +23,14 @@ type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
 pub async fn serve(database: Database, config: Config) -> Result<()> {
     let address = config.api_address.clone();
+    let allowed_origin = config.cors_origin.parse::<HeaderValue>()?;
     let state = Arc::new(ApiState { database, config });
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
+        .allow_origin(allowed_origin)
+        .allow_methods([Method::GET])
         .allow_headers([header::CONTENT_TYPE]);
     let app = Router::new()
-        .route("/api/health", get(|| async { Json(json!({"ok": true})) }))
+        .route("/api/health", get(health))
         .route("/api/status", get(status))
         .route("/api/trades", get(trades))
         .route("/api/fills", get(fills))
@@ -41,6 +42,54 @@ pub async fn serve(database: Database, config: Config) -> Result<()> {
     info!(%address, "dashboard API listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn health(State(state): State<SharedState>) -> (StatusCode, Json<Value>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    let latest_candle = match state
+        .database
+        .latest_candle_time(&state.config.symbol, &state.config.interval)
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "reason": "database query failed"})),
+            );
+        }
+    };
+    let Some(latest_candle) = latest_candle else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "reason": "no closed candle recorded"})),
+        );
+    };
+    let age_ms = now.saturating_sub(latest_candle);
+    let stale = state.config.candle_is_stale(latest_candle, now);
+    let risk = state
+        .database
+        .risk_status(&state.config.mode.to_string(), &state.config.symbol)
+        .await
+        .ok()
+        .flatten();
+    let response = Json(json!({
+        "ok": !stale,
+        "ready_for_entries": !stale && !risk.as_ref().is_some_and(|risk| risk.halted),
+        "reason": if stale { Some("market data is stale") } else { None },
+        "last_candle_time": latest_candle,
+        "candle_age_seconds": age_ms / 1_000,
+        "stale_after_seconds": state.config.stale_data_seconds,
+        "risk_halted": risk.as_ref().is_some_and(|risk| risk.halted),
+    }));
+    if stale {
+        (StatusCode::SERVICE_UNAVAILABLE, response)
+    } else {
+        (StatusCode::OK, response)
+    }
 }
 
 async fn status(State(state): State<SharedState>) -> ApiResult {
@@ -97,4 +146,68 @@ async fn candles(State(state): State<SharedState>) -> ApiResult {
 
 fn internal(error: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binance::Candle;
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
+    #[tokio::test]
+    async fn health_requires_a_recent_candle() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let config = Config::default_for_test();
+        let state = Arc::new(ApiState {
+            database: database.clone(),
+            config: config.clone(),
+        });
+        let (status, body) = health(State(state.clone())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["ok"], false);
+
+        let timestamp = now_ms();
+        database
+            .record_candle(
+                &config.symbol,
+                &config.interval,
+                &Candle {
+                    close_time: timestamp,
+                    close: 100.0,
+                },
+            )
+            .await
+            .unwrap();
+        let (status, body) = health(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn health_rejects_stale_market_data() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let mut config = Config::default_for_test();
+        config.stale_data_seconds = 1;
+        database
+            .record_candle(
+                &config.symbol,
+                &config.interval,
+                &Candle {
+                    close_time: now_ms() - 2_000,
+                    close: 100.0,
+                },
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(ApiState { database, config });
+        let (status, body) = health(State(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["reason"], "market data is stale");
+    }
 }

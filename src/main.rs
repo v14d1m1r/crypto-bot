@@ -186,7 +186,7 @@ async fn run_testnet_bot(config: Config) -> Result<()> {
                 );
             }
             Err(error) => {
-                error!(%error, "Testnet stream failed; reconnecting in 5 seconds");
+                error!(error = %format!("{error:#}"), "Testnet stream failed; reconnecting in 5 seconds");
                 trader.notify_reconnect(format!(
                     "CRUX TESTNET CONNECTION ERROR\n{error}\nRetrying in 5 seconds."
                 ));

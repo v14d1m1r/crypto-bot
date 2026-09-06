@@ -25,6 +25,7 @@ struct MockExchange {
     fail_account_requests: AtomicUsize,
     protection_installed: AtomicBool,
     oco_calls: AtomicUsize,
+    market_calls: AtomicUsize,
 }
 
 impl MockExchange {
@@ -36,6 +37,7 @@ impl MockExchange {
             fail_account_requests: AtomicUsize::new(0),
             protection_installed: AtomicBool::new(false),
             oco_calls: AtomicUsize::new(0),
+            market_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -66,6 +68,11 @@ async fn account_trades(State(state): State<Arc<MockExchange>>) -> Json<Vec<Valu
 }
 
 async fn query_order(State(state): State<Arc<MockExchange>>) -> Json<Value> {
+    Json(state.orders.first().cloned().unwrap_or_else(|| json!({})))
+}
+
+async fn place_market(State(state): State<Arc<MockExchange>>) -> Json<Value> {
+    state.market_calls.fetch_add(1, Ordering::SeqCst);
     Json(state.orders.first().cloned().unwrap_or_else(|| json!({})))
 }
 
@@ -104,7 +111,7 @@ async fn spawn_mock(state: Arc<MockExchange>) -> (String, JoinHandle<()>) {
         .route("/api/v3/account", get(account))
         .route("/api/v3/allOrders", get(all_orders))
         .route("/api/v3/myTrades", get(account_trades))
-        .route("/api/v3/order", get(query_order))
+        .route("/api/v3/order", get(query_order).post(place_market))
         .route("/api/v3/openOrders", get(open_orders))
         .route("/api/v3/avgPrice", get(average_price))
         .route("/api/v3/orderList/oco", post(place_oco))
@@ -161,6 +168,123 @@ fn account_json(base_free: &str, quote_free: &str) -> Value {
         {"asset": "BTC", "free": base_free, "locked": "0"},
         {"asset": "USDT", "free": quote_free, "locked": "0"}
     ]})
+}
+
+#[tokio::test]
+async fn fault_harness_retains_recovered_dust_without_order_attempts() {
+    let state = Arc::new(MockExchange::new(
+        account_json("0.00001", "1000"),
+        vec![json!({
+            "symbol": "BTCUSDT", "orderId": 99, "clientOrderId": "cruxB99",
+            "orderListId": -1, "status": "FILLED", "side": "BUY",
+            "executedQty": "0.00001", "cummulativeQuoteQty": "0.8049145"
+        })],
+        vec![json!({
+            "id": 900, "orderId": 99, "price": "80491.45", "qty": "0.00001",
+            "quoteQty": "0.8049145", "commission": "0", "commissionAsset": "BTC",
+            "time": 1201, "isBuyer": true
+        })],
+    ));
+    let (base, server) = spawn_mock(state.clone()).await;
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let mut trader = trader(base, Decimal::ZERO, None);
+    let config = config();
+    for _ in 0..2 {
+        trader.reconcile(&config, &database).await.unwrap();
+        trader
+            .on_candle(
+                &config,
+                &database,
+                &Candle {
+                    close_time: now_ms().unwrap(),
+                    close: 80491.45,
+                },
+                Some(Signal::Sell),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(trader.tracked_quantity, Decimal::new(1, 5));
+    assert_eq!(trader.entry_price, Some(Decimal::new(8049145, 2)));
+    let saved = database.load_trader_state().await.unwrap().unwrap();
+    assert_eq!(saved.position_quantity, Some(0.00001));
+    assert_eq!(saved.entry_price, Some(80491.45));
+    assert_eq!(database.recent_exchange_fills(10).await.unwrap().len(), 1);
+    assert_eq!(state.oco_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.market_calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn fault_harness_strategy_buy_combines_dust_and_installs_protection() {
+    let state = Arc::new(MockExchange::new(
+        account_json("0.108", "990"),
+        vec![json!({
+            "symbol": "BTCUSDT", "orderId": 99, "clientOrderId": "cruxB99",
+            "orderListId": -1, "transactTime": 1201, "status": "FILLED", "side": "BUY",
+            "executedQty": "0.1", "cummulativeQuoteQty": "10"
+        })],
+        vec![json!({
+            "id": 900, "orderId": 99, "price": "100", "qty": "0.1",
+            "quoteQty": "10", "commission": "0", "commissionAsset": "BTC",
+            "time": 1201, "isBuyer": true
+        })],
+    ));
+    let (base, server) = spawn_mock(state.clone()).await;
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let mut trader = trader(base, Decimal::new(8, 3), Some(Decimal::from(80)));
+    trader
+        .on_candle(
+            &config(),
+            &database,
+            &Candle {
+                close_time: now_ms().unwrap(),
+                close: 100.0,
+            },
+            Some(Signal::Buy),
+        )
+        .await
+        .unwrap();
+    assert_eq!(trader.tracked_quantity, Decimal::new(108, 3));
+    assert_eq!(
+        trader.entry_price,
+        Some(Decimal::new(1064, 2) / Decimal::new(108, 3))
+    );
+    assert_eq!(trader.protective_list_id, Some(999));
+    assert_eq!(state.market_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.oco_calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn fault_harness_completed_sale_preserves_dust_and_clears_protection() {
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let mut trader = trader(
+        String::new(),
+        Decimal::new(108, 3),
+        Some(Decimal::from(100)),
+    );
+    trader.protective_list_id = Some(999);
+    let order = ExecutedOrder {
+        order_id: 901,
+        client_order_id: "cruxT901".into(),
+        timestamp: 2000,
+        side: "SELL".into(),
+        status: "FILLED".into(),
+        executed_base: Decimal::new(1, 1),
+        net_base: Decimal::new(1, 1),
+        gross_quote: Decimal::from(10),
+        net_quote: Decimal::from(10),
+        quote_fee_equivalent: Decimal::ZERO,
+        fills: Vec::new(),
+    };
+    trader
+        .apply_reconciled_sell(&config(), &database, order, "test residual")
+        .await
+        .unwrap();
+    assert_eq!(trader.tracked_quantity, Decimal::new(8, 3));
+    assert_eq!(trader.entry_price, Some(Decimal::from(100)));
+    assert_eq!(trader.protective_list_id, None);
 }
 
 #[tokio::test]

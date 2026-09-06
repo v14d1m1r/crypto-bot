@@ -616,6 +616,15 @@ impl TestnetClient {
 }
 
 impl SymbolRules {
+    // Test the rounded, sellable quantity rather than the raw wallet balance.
+    // Dust stays in accounting but cannot support an exchange order yet.
+    fn is_dust(&self, quantity: Decimal, price: Decimal) -> bool {
+        let quantity = self.round_quantity(quantity);
+        quantity <= Decimal::ZERO
+            || quantity < self.min_quantity
+            || quantity * price < self.min_notional
+    }
+
     fn round_quantity(&self, quantity: Decimal) -> Decimal {
         if self.step_size.is_zero() {
             return quantity;
@@ -736,6 +745,24 @@ pub struct TestnetTrader {
 }
 
 impl TestnetTrader {
+    fn add_buy_to_position(&mut self, quantity: Decimal, cost: Decimal) -> Result<()> {
+        let previous_cost = if self.tracked_quantity.is_zero() {
+            Decimal::ZERO
+        } else {
+            self.tracked_quantity
+                * self
+                    .entry_price
+                    .context("retained position has no cost basis")?
+        };
+        let total_quantity = self.tracked_quantity + quantity;
+        if quantity <= Decimal::ZERO || total_quantity <= Decimal::ZERO {
+            bail!("cannot add a non-positive buy quantity");
+        }
+        self.tracked_quantity = total_quantity;
+        self.entry_price = Some((previous_cost + cost) / total_quantity);
+        Ok(())
+    }
+
     fn risk_limits(config: &Config) -> RiskLimits {
         RiskLimits {
             max_daily_loss_quote: config.max_daily_loss_quote,
@@ -842,7 +869,7 @@ impl TestnetTrader {
             let (recovered_quantity, recovered_entry) =
                 self.reconstruct_open_position(&account_trades, &bot_order_ids)?;
             self.tracked_quantity = recovered_quantity.min(account.total(&self.rules.base_asset));
-            self.entry_price = if self.tracked_quantity >= self.rules.min_quantity {
+            self.entry_price = if self.tracked_quantity > Decimal::ZERO {
                 recovered_entry
             } else {
                 self.tracked_quantity = Decimal::ZERO;
@@ -918,7 +945,7 @@ impl TestnetTrader {
         self.tracked_quantity = self
             .tracked_quantity
             .min(account.total(&self.rules.base_asset));
-        if self.tracked_quantity < self.rules.min_quantity {
+        if self.tracked_quantity.is_zero() {
             self.tracked_quantity = Decimal::ZERO;
             self.entry_price = None;
             self.protective_list_id = None;
@@ -927,13 +954,20 @@ impl TestnetTrader {
             warn!(previous = %previous_quantity, reconciled = %self.tracked_quantity,
                 "local Testnet position adjusted to Binance balance");
         }
-        if self.tracked_quantity > Decimal::ZERO && self.protective_list_id.is_none() {
+        let price = self.client.current_price(&config.symbol).await?;
+        if self.tracked_quantity > Decimal::ZERO
+            && self.protective_list_id.is_none()
+            && self.rules.is_dust(self.tracked_quantity, price)
+        {
+            warn!(quantity = %self.tracked_quantity, %price,
+                min_notional = %self.rules.min_notional,
+                "retaining Testnet dust in accounting; too small for protection or sale");
+        } else if self.tracked_quantity > Decimal::ZERO && self.protective_list_id.is_none() {
             self.install_protection(config, database)
                 .await
                 .context("tracked Testnet position has no exchange-hosted protection")?;
         }
 
-        let price = self.client.current_price(&config.symbol).await?;
         let cash = account.free(&self.rules.quote_asset);
         let equity = cash + self.tracked_quantity * price;
         let timestamp = now_ms()?;
@@ -1044,7 +1078,7 @@ impl TestnetTrader {
                 let debit = (fill_quantity + base_commission).min(quantity);
                 cost -= cost / quantity * debit;
                 quantity -= debit;
-                if quantity < self.rules.min_quantity {
+                if quantity.is_zero() {
                     quantity = Decimal::ZERO;
                     cost = Decimal::ZERO;
                 }
@@ -1079,7 +1113,9 @@ impl TestnetTrader {
         let price = order.gross_quote / order.executed_base;
         let pnl = order.net_quote - self.entry_price.unwrap_or(price) * order.net_base;
         self.tracked_quantity = (self.tracked_quantity - order.net_base).max(Decimal::ZERO);
-        if self.tracked_quantity < self.rules.min_quantity {
+        // The filled list no longer protects any residual balance.
+        self.protective_list_id = None;
+        if self.tracked_quantity.is_zero() {
             self.tracked_quantity = Decimal::ZERO;
             self.entry_price = None;
             self.protective_list_id = None;
@@ -1212,6 +1248,11 @@ impl TestnetTrader {
         signal: Option<Signal>,
     ) -> Result<()> {
         let price = Decimal::from_f64_retain(candle.close).context("invalid candle price")?;
+        let dust = self.rules.is_dust(self.tracked_quantity, price);
+        // A retained residual may become tradable after a price rise.
+        if self.tracked_quantity > Decimal::ZERO && !dust && self.protective_list_id.is_none() {
+            self.install_protection(config, database).await?;
+        }
         let stale_entry = config.candle_is_stale(candle.close_time, now_ms()?);
         let exit_reason = self.entry_price.and_then(|entry| {
             let change = price / entry - Decimal::ONE;
@@ -1229,68 +1270,68 @@ impl TestnetTrader {
                 None
             }
         });
-        let order_and_reason = if self.tracked_quantity.is_zero() && signal == Some(Signal::Buy) {
-            if stale_entry {
-                warn!(
-                    close_time = candle.close_time,
-                    stale_after_seconds = config.stale_data_seconds,
-                    "stale Testnet candle cannot open a new position"
-                );
-                None
-            } else {
-                let risk = self
-                    .refresh_risk(config, database, candle.close_time)
-                    .await?;
-                if risk.halted {
-                    info!(
-                        reason = risk.reason.as_deref().unwrap_or("risk limit reached"),
-                        "Testnet buy signal blocked by risk circuit breaker"
+        let order_and_reason =
+            if dust && self.protective_list_id.is_none() && signal == Some(Signal::Buy) {
+                if stale_entry {
+                    warn!(
+                        close_time = candle.close_time,
+                        stale_after_seconds = config.stale_data_seconds,
+                        "stale Testnet candle cannot open a new position"
                     );
                     None
                 } else {
-                    let account = self.client.account().await?;
-                    let fraction = Decimal::from_f64_retain(config.position_fraction)
-                        .context("invalid position fraction")?;
-                    let cap = Decimal::from_f64_retain(config.max_order_quote)
-                        .context("invalid max order quote")?;
-                    let quote = self
-                        .rules
-                        .round_quote((account.free(&self.rules.quote_asset) * fraction).min(cap));
-                    Some((
-                        self.client
-                            .market_buy(&config.symbol, quote, &self.rules)
-                            .await?,
-                        "EMA crossover",
-                    ))
+                    let risk = self
+                        .refresh_risk(config, database, candle.close_time)
+                        .await?;
+                    if risk.halted {
+                        info!(
+                            reason = risk.reason.as_deref().unwrap_or("risk limit reached"),
+                            "Testnet buy signal blocked by risk circuit breaker"
+                        );
+                        None
+                    } else {
+                        let account = self.client.account().await?;
+                        let fraction = Decimal::from_f64_retain(config.position_fraction)
+                            .context("invalid position fraction")?;
+                        let cap = Decimal::from_f64_retain(config.max_order_quote)
+                            .context("invalid max order quote")?;
+                        let quote = self.rules.round_quote(
+                            (account.free(&self.rules.quote_asset) * fraction).min(cap),
+                        );
+                        Some((
+                            self.client
+                                .market_buy(&config.symbol, quote, &self.rules)
+                                .await?,
+                            "EMA crossover",
+                        ))
+                    }
                 }
-            }
-        } else if let Some(reason) = exit_reason {
-            self.cancel_protection(config).await?;
-            let account = self.client.account().await?;
-            let quantity = self
-                .tracked_quantity
-                .min(account.free(&self.rules.base_asset));
-            Some((
-                self.client
-                    .market_sell(&config.symbol, quantity, &self.rules)
-                    .await?,
-                reason,
-            ))
-        } else {
-            None
-        };
+            } else if let Some(reason) = exit_reason.filter(|_| !dust) {
+                self.cancel_protection(config).await?;
+                let account = self.client.account().await?;
+                let quantity = self
+                    .tracked_quantity
+                    .min(account.free(&self.rules.base_asset));
+                Some((
+                    self.client
+                        .market_sell(&config.symbol, quantity, &self.rules)
+                        .await?,
+                    reason,
+                ))
+            } else {
+                None
+            };
 
         if let Some((order, reason)) = order_and_reason {
             let was_buy = order.side == "BUY";
             let average_price = order.gross_quote / order.executed_base;
             let realized_pnl = if order.side == "BUY" {
-                self.tracked_quantity = order.net_base;
-                self.entry_price = Some(order.net_quote / order.net_base);
+                self.add_buy_to_position(order.net_base, order.net_quote)?;
                 Decimal::ZERO
             } else {
                 let cost = self.entry_price.unwrap_or(average_price) * order.net_base;
                 self.tracked_quantity = (self.tracked_quantity - order.net_base).max(Decimal::ZERO);
-                if self.tracked_quantity < self.rules.min_quantity {
+                if self.tracked_quantity.is_zero() {
                     self.tracked_quantity = Decimal::ZERO;
                     self.entry_price = None;
                 }
@@ -1357,8 +1398,11 @@ impl TestnetTrader {
                     realized_pnl: decimal_f64(emergency_pnl)?,
                     reason: "protection failure",
                 };
-                self.tracked_quantity = Decimal::ZERO;
-                self.entry_price = None;
+                self.tracked_quantity =
+                    (self.tracked_quantity - emergency.net_base).max(Decimal::ZERO);
+                if self.tracked_quantity.is_zero() {
+                    self.entry_price = None;
+                }
                 database
                     .record_exchange_order(
                         "testnet",
@@ -1654,6 +1698,16 @@ mod tests {
     #[test]
     fn rejects_too_small_notional() {
         assert!(rules().validate_notional(Decimal::from(4)).is_err());
+    }
+
+    #[test]
+    fn dust_uses_rounded_quantity_and_current_notional() {
+        let rules = rules();
+        assert!(rules.is_dust(Decimal::new(1, 5), Decimal::new(8049145, 2)));
+        assert!(rules.is_dust(Decimal::new(1, 6), Decimal::from(10_000_000)));
+        assert!(rules.is_dust(Decimal::new(699, 7), Decimal::from(80_000)));
+        assert!(!rules.is_dust(Decimal::new(1, 4), Decimal::from(50_000)));
+        assert!(!rules.is_dust(Decimal::from(101), Decimal::from(80_000)));
     }
 
     #[test]

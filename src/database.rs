@@ -1,6 +1,7 @@
 use std::{str::FromStr, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use rust_decimal::Decimal;
 use serde::Serialize;
 use sqlx::{
     FromRow, SqlitePool,
@@ -15,6 +16,23 @@ use crate::{
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
+}
+
+#[derive(Debug, FromRow)]
+pub struct BudgetRow {
+    pub capital: String,
+    pub initial_cash: String,
+    pub initial_quantity: String,
+    pub initial_cost: String,
+    pub started_at: i64,
+    pub snapshot_start_id: i64,
+    pub flow_start_id: i64,
+}
+
+pub struct BudgetBalance {
+    pub cash: Decimal,
+    pub quantity: Decimal,
+    pub cost: Decimal,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -139,8 +157,100 @@ impl Database {
             .execute(&self.pool).await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS risk_state (id INTEGER PRIMARY KEY, environment TEXT NOT NULL, symbol TEXT NOT NULL, utc_day_start INTEGER NOT NULL, halted INTEGER NOT NULL, reason TEXT, daily_realized_pnl REAL NOT NULL, entries_today INTEGER NOT NULL, consecutive_losses INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(environment, symbol))")
             .execute(&self.pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS testnet_budget (symbol TEXT PRIMARY KEY, capital TEXT NOT NULL, initial_cash TEXT NOT NULL, initial_quantity TEXT NOT NULL, initial_cost TEXT NOT NULL, started_at INTEGER NOT NULL, snapshot_start_id INTEGER NOT NULL, flow_start_id INTEGER NOT NULL)")
+            .execute(&self.pool).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS testnet_budget_flows (symbol TEXT NOT NULL, trade_id INTEGER NOT NULL, timestamp INTEGER NOT NULL, quote_delta TEXT NOT NULL, base_delta TEXT NOT NULL, PRIMARY KEY(symbol, trade_id))")
+            .execute(&self.pool).await?;
         sqlx::query("PRAGMA optimize").execute(&self.pool).await?;
         Ok(())
+    }
+
+    pub async fn budget(&self, symbol: &str) -> Result<Option<BudgetRow>> {
+        Ok(sqlx::query_as("SELECT capital, initial_cash, initial_quantity, initial_cost, started_at, snapshot_start_id, flow_start_id FROM testnet_budget WHERE symbol=?")
+            .bind(symbol).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn initialize_budget(
+        &self,
+        symbol: &str,
+        capital: Decimal,
+        quantity: Decimal,
+        price: Decimal,
+        entry: Decimal,
+        timestamp: i64,
+    ) -> Result<()> {
+        if let Some(existing) = self.budget(symbol).await? {
+            if Decimal::from_str(&existing.capital)? != capital {
+                bail!(
+                    "BOT_TESTNET_BUDGET differs from the persisted budget {}; restore that setting (restarts do not reset capital)",
+                    existing.capital
+                );
+            }
+            return Ok(());
+        }
+        let cash = capital - quantity * price;
+        if cash < Decimal::ZERO {
+            bail!(
+                "existing tracked position exceeds BOT_TESTNET_BUDGET; budget was not initialized"
+            );
+        }
+        sqlx::query("INSERT INTO testnet_budget(symbol, capital, initial_cash, initial_quantity, initial_cost, started_at, snapshot_start_id, flow_start_id) VALUES (?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(id), 0) FROM equity_snapshots), (SELECT COALESCE(MAX(rowid), 0) FROM testnet_budget_flows))")
+            .bind(symbol).bind(capital.to_string()).bind(cash.to_string())
+            .bind(quantity.to_string()).bind((quantity * entry).to_string()).bind(timestamp)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn record_budget_flow(
+        &self,
+        symbol: &str,
+        trade_id: i64,
+        timestamp: i64,
+        quote_delta: Decimal,
+        base_delta: Decimal,
+    ) -> Result<()> {
+        sqlx::query("INSERT OR IGNORE INTO testnet_budget_flows(symbol, trade_id, timestamp, quote_delta, base_delta) VALUES (?, ?, ?, ?, ?)")
+            .bind(symbol).bind(trade_id).bind(timestamp).bind(quote_delta.to_string())
+            .bind(base_delta.to_string()).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn budget_balance(&self, symbol: &str) -> Result<Option<BudgetBalance>> {
+        let Some(budget) = self.budget(symbol).await? else {
+            return Ok(None);
+        };
+        let mut balance = BudgetBalance {
+            cash: Decimal::from_str(&budget.initial_cash)?,
+            quantity: Decimal::from_str(&budget.initial_quantity)?,
+            cost: Decimal::from_str(&budget.initial_cost)?,
+        };
+        let flows: Vec<(String, String)> = sqlx::query_as("SELECT quote_delta, base_delta FROM testnet_budget_flows WHERE symbol=? AND timestamp>=? AND rowid>? ORDER BY timestamp, trade_id")
+            .bind(symbol).bind(budget.started_at).bind(budget.flow_start_id).fetch_all(&self.pool).await?;
+        for (quote, base) in flows {
+            let quote = Decimal::from_str(&quote)?;
+            let base = Decimal::from_str(&base)?;
+            balance.cash += quote;
+            if base > Decimal::ZERO {
+                balance.cost -= quote;
+                balance.quantity += base;
+            } else if balance.quantity > Decimal::ZERO {
+                let debit = (-base).min(balance.quantity);
+                balance.cost -= balance.cost / balance.quantity * debit;
+                balance.quantity -= debit;
+            }
+        }
+        Ok(Some(balance))
+    }
+
+    pub async fn budget_equity(&self, symbol: &str, limit: i64) -> Result<Vec<EquityRow>> {
+        let budget = self
+            .budget(symbol)
+            .await?
+            .context("budget not initialized")?;
+        let mut rows = sqlx::query_as::<_, EquityRow>("SELECT timestamp, cash, equity, position_quantity, price FROM equity_snapshots WHERE id>? ORDER BY id DESC LIMIT ?")
+            .bind(budget.snapshot_start_id).bind(limit).fetch_all(&self.pool).await?;
+        rows.reverse();
+        Ok(rows)
     }
 
     pub async fn record_candle(&self, symbol: &str, interval: &str, candle: &Candle) -> Result<()> {
@@ -379,6 +489,106 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn budget_activation_boundary_counts_new_fills_in_same_millisecond() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.record_budget_flow("BTCUSDT", 1, 100, Decimal::from(-10), Decimal::new(1, 1))
+            .await
+            .unwrap();
+        db.initialize_budget(
+            "BTCUSDT",
+            Decimal::from(100),
+            Decimal::new(1, 1),
+            Decimal::from(100),
+            Decimal::from(100),
+            100,
+        )
+        .await
+        .unwrap();
+        // Existing fill at the boundary is adopted, not debited twice.
+        db.record_budget_flow("BTCUSDT", 1, 100, Decimal::from(-10), Decimal::new(1, 1))
+            .await
+            .unwrap();
+        // New fill in that same millisecond must still be counted.
+        db.record_budget_flow("BTCUSDT", 2, 100, Decimal::from(-20), Decimal::new(2, 1))
+            .await
+            .unwrap();
+        // Older history discovered later must not be charged to the new budget.
+        db.record_budget_flow("BTCUSDT", 3, 90, Decimal::from(-50), Decimal::new(5, 1))
+            .await
+            .unwrap();
+        let result = db.budget_balance("BTCUSDT").await.unwrap().unwrap();
+        assert_eq!(result.cash, Decimal::from(70));
+        assert_eq!(result.quantity, Decimal::new(3, 1));
+    }
+
+    #[tokio::test]
+    async fn budget_adopts_existing_position_and_accounts_for_round_trip_once() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        // Historic cash flows are outside the new budget's lifetime.
+        db.record_budget_flow("BTCUSDT", 1, 99, Decimal::from(-500), Decimal::from(5))
+            .await
+            .unwrap();
+        db.initialize_budget(
+            "BTCUSDT",
+            Decimal::from(100),
+            Decimal::new(2, 1),
+            Decimal::from(100),
+            Decimal::from(90),
+            100,
+        )
+        .await
+        .unwrap();
+        let initial = db.budget_balance("BTCUSDT").await.unwrap().unwrap();
+        assert_eq!(initial.cash, Decimal::from(80));
+        assert_eq!(
+            initial.cash + initial.quantity * Decimal::from(100),
+            Decimal::from(100)
+        );
+        // Sell the adopted position for 22, less 0.022 quote commission.
+        for _ in 0..2 {
+            db.record_budget_flow(
+                "BTCUSDT",
+                2,
+                101,
+                Decimal::new(21978, 3),
+                Decimal::new(-2, 1),
+            )
+            .await
+            .unwrap();
+        }
+        let result = db.budget_balance("BTCUSDT").await.unwrap().unwrap();
+        assert_eq!(result.cash, Decimal::new(101978, 3));
+        assert_eq!(result.quantity, Decimal::ZERO);
+        assert_eq!(result.cost, Decimal::ZERO);
+        db.initialize_budget(
+            "BTCUSDT",
+            Decimal::from(100),
+            Decimal::ZERO,
+            Decimal::from(100),
+            Decimal::ZERO,
+            200,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.budget_balance("BTCUSDT").await.unwrap().unwrap().cash,
+            result.cash
+        );
+        assert!(
+            db.initialize_budget(
+                "ETHUSDT",
+                Decimal::from(100),
+                Decimal::from(2),
+                Decimal::from(100),
+                Decimal::from(100),
+                200
+            )
+            .await
+            .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn sqlite_connections_enable_safety_pragmas() {

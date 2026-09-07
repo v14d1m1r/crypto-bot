@@ -25,6 +25,7 @@ pub struct Config {
     pub fast_ema: usize,
     pub slow_ema: usize,
     pub starting_cash: f64,
+    pub testnet_budget: Option<f64>,
     pub position_fraction: f64,
     pub fee_rate: f64,
     pub stop_loss: f64,
@@ -81,6 +82,10 @@ impl Config {
             fast_ema: env_value("BOT_FAST_EMA", 20)?,
             slow_ema: env_value("BOT_SLOW_EMA", 50)?,
             starting_cash: env_value("BOT_STARTING_CASH", 10_000.0)?,
+            testnet_budget: env::var("BOT_TESTNET_BUDGET")
+                .ok()
+                .map(|value| value.parse::<f64>().context("invalid BOT_TESTNET_BUDGET"))
+                .transpose()?,
             position_fraction: env_value("BOT_POSITION_FRACTION", 0.25)?,
             fee_rate: env_value("BOT_FEE_RATE", 0.001)?,
             stop_loss: env_value("BOT_STOP_LOSS", 0.02)?,
@@ -139,8 +144,14 @@ impl Config {
         if self.fast_ema == 0 || self.fast_ema >= self.slow_ema || self.slow_ema > 1_000 {
             bail!("EMA windows must satisfy 0 < BOT_FAST_EMA < BOT_SLOW_EMA <= 1000");
         }
-        if self.starting_cash <= 0.0 {
+        if !self.starting_cash.is_finite() || self.starting_cash <= 0.0 {
             bail!("BOT_STARTING_CASH must be positive");
+        }
+        if self
+            .testnet_budget
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            bail!("BOT_TESTNET_BUDGET must be finite and positive");
         }
         validate_fraction("BOT_POSITION_FRACTION", self.position_fraction, false)?;
         validate_fraction("BOT_FEE_RATE", self.fee_rate, true)?;
@@ -217,6 +228,7 @@ impl Config {
             fast_ema: 20,
             slow_ema: 50,
             starting_cash: 10_000.0,
+            testnet_budget: None,
             position_fraction: 0.25,
             fee_rate: 0.001,
             stop_loss: 0.02,
@@ -316,6 +328,17 @@ fn validate_fraction(name: &str, value: f64, allow_zero: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_budget_amounts() {
+        let mut config = Config::default_for_test();
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            config.testnet_budget = Some(value);
+            assert!(config.validate().is_err());
+        }
+        config.testnet_budget = Some(100.0);
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn interval_to_seconds_supports_configured_units() {

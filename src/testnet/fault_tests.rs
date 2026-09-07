@@ -1,11 +1,11 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -26,6 +26,7 @@ struct MockExchange {
     protection_installed: AtomicBool,
     oco_calls: AtomicUsize,
     market_calls: AtomicUsize,
+    requested_quotes: Mutex<Vec<String>>,
 }
 
 impl MockExchange {
@@ -38,6 +39,7 @@ impl MockExchange {
             protection_installed: AtomicBool::new(false),
             oco_calls: AtomicUsize::new(0),
             market_calls: AtomicUsize::new(0),
+            requested_quotes: Mutex::new(Vec::new()),
         }
     }
 }
@@ -71,8 +73,14 @@ async fn query_order(State(state): State<Arc<MockExchange>>) -> Json<Value> {
     Json(state.orders.first().cloned().unwrap_or_else(|| json!({})))
 }
 
-async fn place_market(State(state): State<Arc<MockExchange>>) -> Json<Value> {
+async fn place_market(
+    State(state): State<Arc<MockExchange>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
     state.market_calls.fetch_add(1, Ordering::SeqCst);
+    if let Some(quote) = query.get("quoteOrderQty") {
+        state.requested_quotes.lock().unwrap().push(quote.clone());
+    }
     Json(state.orders.first().cloned().unwrap_or_else(|| json!({})))
 }
 
@@ -168,6 +176,151 @@ fn account_json(base_free: &str, quote_free: &str) -> Value {
         {"asset": "BTC", "free": base_free, "locked": "0"},
         {"asset": "USDT", "free": quote_free, "locked": "0"}
     ]})
+}
+
+#[tokio::test]
+async fn fault_harness_budget_ignores_exchange_wallet_and_survives_restart() {
+    let state = Arc::new(MockExchange::new(
+        account_json("1", "10000"),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let (base, server) = spawn_mock(state).await;
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let mut config = config();
+    config.testnet_budget = Some(100.0);
+    let mut first = trader(base.clone(), Decimal::ZERO, None);
+    first.reconcile(&config, &database).await.unwrap();
+    assert_eq!(database.status().await.unwrap().unwrap().equity, 100.0);
+    let started = database
+        .budget(&config.symbol)
+        .await
+        .unwrap()
+        .unwrap()
+        .started_at;
+    database
+        .record_budget_flow(
+            &config.symbol,
+            1000,
+            started + 1,
+            Decimal::from(-10),
+            Decimal::ZERO,
+        )
+        .await
+        .unwrap();
+    let mut restarted = trader(base, Decimal::ZERO, None);
+    restarted.reconcile(&config, &database).await.unwrap();
+    assert_eq!(database.status().await.unwrap().unwrap().cash, 90.0);
+    config.testnet_budget = Some(200.0);
+    assert!(restarted.reconcile(&config, &database).await.is_err());
+    config.testnet_budget = None;
+    assert!(restarted.reconcile(&config, &database).await.is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn fault_harness_budget_sizes_buy_and_recovers_filled_order_once() {
+    let state = Arc::new(MockExchange::new(
+        account_json("1", "10000"),
+        vec![json!({
+            "symbol":"BTCUSDT", "orderId":99, "clientOrderId":"cruxB99", "orderListId":-1,
+            "transactTime":1201, "status":"FILLED", "side":"BUY", "executedQty":"0.25", "cummulativeQuoteQty":"25"
+        })],
+        vec![
+            json!({"id":900,"orderId":99,"price":"100","qty":"0.25","quoteQty":"25",
+            "commission":"0.025","commissionAsset":"USDT","time":1201,"isBuyer":true}),
+        ],
+    ));
+    let (base, server) = spawn_mock(state.clone()).await;
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let mut config = config();
+    config.testnet_budget = Some(100.0);
+    database
+        .initialize_budget(
+            &config.symbol,
+            Decimal::from(100),
+            Decimal::ZERO,
+            Decimal::from(100),
+            Decimal::ZERO,
+            1000,
+        )
+        .await
+        .unwrap();
+    let mut first = trader(base.clone(), Decimal::ZERO, None);
+    first
+        .on_candle(
+            &config,
+            &database,
+            &Candle {
+                close_time: now_ms().unwrap(),
+                close: 100.0,
+            },
+            Some(Signal::Buy),
+        )
+        .await
+        .unwrap();
+    assert_eq!(*state.requested_quotes.lock().unwrap(), vec!["25"]);
+    let balance = database
+        .budget_balance(&config.symbol)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(balance.cash, Decimal::new(74975, 3));
+    assert_eq!(balance.quantity, Decimal::new(25, 2));
+    // Simulate stale bot_state after a crash: replay the exchange fill instead.
+    let mut restarted = trader(base, Decimal::ZERO, None);
+    restarted.reconcile(&config, &database).await.unwrap();
+    restarted.reconcile(&config, &database).await.unwrap();
+    let saved = database.status().await.unwrap().unwrap();
+    assert_eq!(saved.cash, 74.975);
+    assert_eq!(saved.equity, 99.975);
+    assert_eq!(restarted.tracked_quantity, Decimal::new(25, 2));
+    assert_eq!(state.market_calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn fault_harness_depleted_budget_does_not_use_exchange_reserves() {
+    let state = Arc::new(MockExchange::new(
+        account_json("1", "10000"),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let (base, server) = spawn_mock(state.clone()).await;
+    let database = Database::connect("sqlite::memory:").await.unwrap();
+    let mut config = config();
+    config.testnet_budget = Some(100.0);
+    database
+        .initialize_budget(
+            &config.symbol,
+            Decimal::from(100),
+            Decimal::ZERO,
+            Decimal::from(100),
+            Decimal::ZERO,
+            1000,
+        )
+        .await
+        .unwrap();
+    database
+        .record_budget_flow(&config.symbol, 1, 1001, Decimal::from(-99), Decimal::ZERO)
+        .await
+        .unwrap();
+    let mut trader = trader(base, Decimal::ZERO, None);
+    trader
+        .on_candle(
+            &config,
+            &database,
+            &Candle {
+                close_time: now_ms().unwrap(),
+                close: 100.0,
+            },
+            Some(Signal::Buy),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.market_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(database.status().await.unwrap().unwrap().equity, 1.0);
+    server.abort();
 }
 
 #[tokio::test]

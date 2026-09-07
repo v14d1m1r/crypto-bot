@@ -134,6 +134,47 @@ Use the exact backup filename; do not paste the placeholder literally.
 
 ## Updating
 
+### Enable a 100-USDT budget on an existing deployment
+
+Commit and push the budget changes from your local checkout, then run on Linode:
+
+```bash
+cd /home/src/crypto-bot
+git pull --ff-only
+cargo test --locked && cargo build --release --locked
+```
+
+After the build succeeds, make an online database backup and stop the service:
+
+```bash
+sudo systemctl start crypto-bot-backup.service
+sudo systemctl stop crypto-bot.service
+sudoedit /etc/crypto-bot/crypto-bot.env
+```
+
+Add or update these settings (do not replace the file containing your credentials):
+
+```dotenv
+BOT_TESTNET_BUDGET=100
+BOT_POSITION_FRACTION=0.25
+BOT_MAX_ORDER_QUOTE=25
+```
+
+Install and start the updated binary:
+
+```bash
+sudo install -o root -g root -m 0755 target/release/crypto-bot /opt/crypto-bot/bin/crypto-bot
+sudo systemctl restart crypto-bot.service
+sudo journalctl -u crypto-bot.service --since "1 minute ago" --no-pager -l
+curl --fail-with-body http://127.0.0.1:3001/api/status
+```
+
+The response includes `budget.initial_equity: 100`. The current equity starts near 100 USDT and then changes with fills and prices. The initial tracked position counts toward that allocation; unrelated exchange funds do not. Existing positions larger than the requested budget prevent activation. Restart the local dashboard with `npm.cmd run dev` from `dashboard/` if it is not already picking up the updated files, and keep the SSH tunnel open.
+
+No database deletion is needed. Keep `BOT_TESTNET_BUDGET=100` on later restarts: the allocation is persistent, so changing/removing the setting will fail startup rather than refill losses. Existing circuit-breaker halts are preserved. Backups include the budget tables. The dashboard excludes pre-budget equity snapshots from its chart and keeps historical trades visible. See the [budget accounting notes](../README.md#testnet-portfolio-budget) for fee handling.
+
+### Regular code updates
+
 Build and test the new revision before replacing the binary:
 
 ```bash

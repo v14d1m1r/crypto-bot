@@ -847,6 +847,20 @@ impl TestnetTrader {
     /// during process startup, because order events can be missed while either
     /// WebSocket is disconnected.
     async fn reconcile(&mut self, config: &Config, database: &Database) -> Result<()> {
+        if let Some(budget) = database.budget(&config.symbol).await? {
+            let configured = config
+                .testnet_budget
+                .and_then(Decimal::from_f64_retain)
+                .context(
+                    "restore BOT_TESTNET_BUDGET: this database already has a persistent budget",
+                )?;
+            if configured != Decimal::from_str(&budget.capital)? {
+                bail!(
+                    "restore BOT_TESTNET_BUDGET={}: changing the setting cannot reset an existing budget",
+                    budget.capital
+                );
+            }
+        }
         let account = self
             .client
             .account()
@@ -863,7 +877,7 @@ impl TestnetTrader {
             .iter()
             .filter(|fill| bot_order_ids.contains(&fill.order_id))
         {
-            Self::record_fill(database, &config.symbol, fill).await?;
+            Self::record_fill(database, &config.symbol, fill, &self.rules).await?;
         }
         if self.tracked_quantity.is_zero() {
             let (recovered_quantity, recovered_entry) =
@@ -941,6 +955,16 @@ impl TestnetTrader {
             .find(|order| order.client_order_id.starts_with("crux") && order.order_list_id >= 0)
             .map(|order| order.order_list_id);
 
+        // Replay durable, deduplicated fills so a crash between an exchange fill
+        // and saving bot_state cannot lose a budget purchase or credit it twice.
+        if let Some(balance) = database.budget_balance(&config.symbol).await? {
+            self.tracked_quantity = balance.quantity;
+            self.entry_price = if balance.quantity > Decimal::ZERO {
+                Some(balance.cost / balance.quantity)
+            } else {
+                None
+            };
+        }
         let previous_quantity = self.tracked_quantity;
         self.tracked_quantity = self
             .tracked_quantity
@@ -955,6 +979,24 @@ impl TestnetTrader {
                 "local Testnet position adjusted to Binance balance");
         }
         let price = self.client.current_price(&config.symbol).await?;
+        if let Some(capital) = config.testnet_budget {
+            let capital = Decimal::from_f64_retain(capital).context("invalid Testnet budget")?;
+            if database.budget(&config.symbol).await?.is_none()
+                && capital - self.tracked_quantity * price > account.free(&self.rules.quote_asset)
+            {
+                bail!("Testnet account has insufficient available cash to fund BOT_TESTNET_BUDGET");
+            }
+            database
+                .initialize_budget(
+                    &config.symbol,
+                    capital,
+                    self.tracked_quantity,
+                    price,
+                    self.entry_price.unwrap_or(price),
+                    self.client.timestamp()?,
+                )
+                .await?;
+        }
         if self.tracked_quantity > Decimal::ZERO
             && self.protective_list_id.is_none()
             && self.rules.is_dust(self.tracked_quantity, price)
@@ -968,7 +1010,7 @@ impl TestnetTrader {
                 .context("tracked Testnet position has no exchange-hosted protection")?;
         }
 
-        let cash = account.free(&self.rules.quote_asset);
+        let cash = self.portfolio_cash(config, database, &account).await?;
         let equity = cash + self.tracked_quantity * price;
         let timestamp = now_ms()?;
         database
@@ -1028,7 +1070,12 @@ impl TestnetTrader {
         }
     }
 
-    async fn record_fill(database: &Database, symbol: &str, fill: &AccountTrade) -> Result<()> {
+    async fn record_fill(
+        database: &Database,
+        symbol: &str,
+        fill: &AccountTrade,
+        rules: &SymbolRules,
+    ) -> Result<()> {
         database
             .record_exchange_fill(
                 "testnet",
@@ -1042,7 +1089,41 @@ impl TestnetTrader {
                 &fill.commission_asset,
                 fill.time,
             )
+            .await?;
+        let commission = Decimal::from_str(&fill.commission)?;
+        let quote_fee = if fill.commission_asset == rules.quote_asset {
+            commission
+        } else {
+            Decimal::ZERO
+        };
+        let base_fee = if fill.commission_asset == rules.base_asset {
+            commission
+        } else {
+            Decimal::ZERO
+        };
+        let quote = Decimal::from_str(&fill.quote_qty)?;
+        let base = Decimal::from_str(&fill.qty)?;
+        database
+            .record_budget_flow(
+                symbol,
+                fill.id,
+                fill.time,
+                (if fill.is_buyer { -quote } else { quote }) - quote_fee,
+                (if fill.is_buyer { base } else { -base }) - base_fee,
+            )
             .await
+    }
+
+    async fn portfolio_cash(
+        &self,
+        config: &Config,
+        database: &Database,
+        account: &AccountSnapshot,
+    ) -> Result<Decimal> {
+        Ok(match database.budget_balance(&config.symbol).await? {
+            Some(balance) => balance.cash,
+            None => account.free(&self.rules.quote_asset),
+        })
     }
 
     fn reconstruct_open_position(
@@ -1096,9 +1177,10 @@ impl TestnetTrader {
         database: &Database,
         symbol: &str,
         order: &ExecutedOrder,
+        rules: &SymbolRules,
     ) -> Result<()> {
         for fill in &order.fills {
-            Self::record_fill(database, symbol, fill).await?;
+            Self::record_fill(database, symbol, fill, rules).await?;
         }
         Ok(())
     }
@@ -1270,34 +1352,49 @@ impl TestnetTrader {
                 None
             }
         });
-        let order_and_reason =
-            if dust && self.protective_list_id.is_none() && signal == Some(Signal::Buy) {
-                if stale_entry {
-                    warn!(
-                        close_time = candle.close_time,
-                        stale_after_seconds = config.stale_data_seconds,
-                        "stale Testnet candle cannot open a new position"
+        let order_and_reason = if dust
+            && self.protective_list_id.is_none()
+            && signal == Some(Signal::Buy)
+        {
+            if stale_entry {
+                warn!(
+                    close_time = candle.close_time,
+                    stale_after_seconds = config.stale_data_seconds,
+                    "stale Testnet candle cannot open a new position"
+                );
+                None
+            } else {
+                let risk = self
+                    .refresh_risk(config, database, candle.close_time)
+                    .await?;
+                if risk.halted {
+                    info!(
+                        reason = risk.reason.as_deref().unwrap_or("risk limit reached"),
+                        "Testnet buy signal blocked by risk circuit breaker"
                     );
                     None
                 } else {
-                    let risk = self
-                        .refresh_risk(config, database, candle.close_time)
-                        .await?;
-                    if risk.halted {
-                        info!(
-                            reason = risk.reason.as_deref().unwrap_or("risk limit reached"),
-                            "Testnet buy signal blocked by risk circuit breaker"
-                        );
+                    let account = self.client.account().await?;
+                    let fraction = Decimal::from_f64_retain(config.position_fraction)
+                        .context("invalid position fraction")?;
+                    let cap = Decimal::from_f64_retain(config.max_order_quote)
+                        .context("invalid max order quote")?;
+                    let available = self
+                        .portfolio_cash(config, database, &account)
+                        .await?
+                        .min(account.free(&self.rules.quote_asset))
+                        .max(Decimal::ZERO);
+                    let fee =
+                        Decimal::from_f64_retain(config.fee_rate).context("invalid fee reserve")?;
+                    let quote = self.rules.round_quote(
+                        (available * fraction)
+                            .min(cap)
+                            .min(available / (Decimal::ONE + fee)),
+                    );
+                    if quote < self.rules.min_notional {
+                        info!(%available, %quote, "Testnet buy skipped: allocated cash is below the minimum order value");
                         None
                     } else {
-                        let account = self.client.account().await?;
-                        let fraction = Decimal::from_f64_retain(config.position_fraction)
-                            .context("invalid position fraction")?;
-                        let cap = Decimal::from_f64_retain(config.max_order_quote)
-                            .context("invalid max order quote")?;
-                        let quote = self.rules.round_quote(
-                            (account.free(&self.rules.quote_asset) * fraction).min(cap),
-                        );
                         Some((
                             self.client
                                 .market_buy(&config.symbol, quote, &self.rules)
@@ -1306,21 +1403,22 @@ impl TestnetTrader {
                         ))
                     }
                 }
-            } else if let Some(reason) = exit_reason.filter(|_| !dust) {
-                self.cancel_protection(config).await?;
-                let account = self.client.account().await?;
-                let quantity = self
-                    .tracked_quantity
-                    .min(account.free(&self.rules.base_asset));
-                Some((
-                    self.client
-                        .market_sell(&config.symbol, quantity, &self.rules)
-                        .await?,
-                    reason,
-                ))
-            } else {
-                None
-            };
+            }
+        } else if let Some(reason) = exit_reason.filter(|_| !dust) {
+            self.cancel_protection(config).await?;
+            let account = self.client.account().await?;
+            let quantity = self
+                .tracked_quantity
+                .min(account.free(&self.rules.base_asset));
+            Some((
+                self.client
+                    .market_sell(&config.symbol, quantity, &self.rules)
+                    .await?,
+                reason,
+            ))
+        } else {
+            None
+        };
 
         if let Some((order, reason)) = order_and_reason {
             let was_buy = order.side == "BUY";
@@ -1359,7 +1457,7 @@ impl TestnetTrader {
                     order.timestamp,
                 )
                 .await?;
-            Self::record_order_fills(database, &config.symbol, &order).await?;
+            Self::record_order_fills(database, &config.symbol, &order, &self.rules).await?;
             let inserted = database
                 .record_exchange_trade_once("testnet", &config.symbol, order.order_id, &trade)
                 .await?;
@@ -1416,7 +1514,7 @@ impl TestnetTrader {
                         emergency.timestamp,
                     )
                     .await?;
-                Self::record_order_fills(database, &config.symbol, &emergency).await?;
+                Self::record_order_fills(database, &config.symbol, &emergency, &self.rules).await?;
                 let inserted = database
                     .record_exchange_trade_once(
                         "testnet",
@@ -1438,7 +1536,7 @@ impl TestnetTrader {
         }
 
         let account = self.client.account().await?;
-        let cash = account.free(&self.rules.quote_asset);
+        let cash = self.portfolio_cash(config, database, &account).await?;
         let equity = cash + self.tracked_quantity * price;
         database
             .record_candle(&config.symbol, &config.interval, candle)
@@ -1511,12 +1609,12 @@ impl TestnetTrader {
                 .account_trades_for_order(&config.symbol, event.order_id)
                 .await?;
             let order = ExecutedOrder::from_response_and_trades(response, fills, &self.rules)?;
-            Self::record_order_fills(database, &config.symbol, &order).await?;
+            Self::record_order_fills(database, &config.symbol, &order, &self.rules).await?;
             let price = order.gross_quote / order.executed_base;
             self.apply_reconciled_sell(config, database, order, reason)
                 .await?;
             let account = self.client.account().await?;
-            let cash = account.free(&self.rules.quote_asset);
+            let cash = self.portfolio_cash(config, database, &account).await?;
             let equity = cash + self.tracked_quantity * price;
             database
                 .save_state(

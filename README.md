@@ -97,6 +97,7 @@ $env:BOT_MODE = "testnet"
 $env:BINANCE_TESTNET_API_KEY = "your-testnet-api-key"
 $env:BINANCE_TESTNET_SECRET_KEY = "your-testnet-secret"
 $env:BOT_MAX_ORDER_QUOTE = "25"
+$env:BOT_TESTNET_BUDGET = "100"
 $env:BOT_MAX_DAILY_LOSS_QUOTE = "10"
 $env:BOT_MAX_ENTRIES_PER_DAY = "10"
 $env:BOT_MAX_CONSECUTIVE_LOSSES = "3"
@@ -133,6 +134,18 @@ In Testnet mode the bot:
 Every Binance fill is stored once by its exchange trade ID, including its native commission amount and asset. The summarized `trades.fee` value is exact in USDT when commission is charged in USDT, and uses the fill price when commission is charged in BTC. A commission paid in a third asset such as BNB remains exact in `/api/fills` but is not converted to a historical USDT value.
 
 Risk status and configured limits are returned by `GET /api/status`. Once triggered, the Testnet circuit breaker stays halted in SQLite for the rest of that UTC day even if the process restarts. It resets automatically on the first evaluation in the next UTC day. The breaker never prevents an existing position from being closed.
+
+### Testnet portfolio budget
+
+Set `BOT_TESTNET_BUDGET=100` to allocate 100 USDT to this bot independently of the exchange's virtual wallet. `BOT_STARTING_CASH` still initializes new paper accounts; it does not fund a Testnet budget. Without the budget setting, existing unbudgeted databases retain their original behavior.
+
+At first activation, the bot deducts the current value of its tracked BTC (including dust) from the allocation, so initial cash plus that position equals 100 USDT. Unrelated wallet BTC is excluded. Activation fails if the tracked position exceeds the allocation or available exchange cash cannot fund the remainder. Use one database per symbol and run only one bot process against it.
+
+The initial allocation and exact decimal cash flows persist in SQLite. Bot buys debit the budget, sells credit it, and quote/base commissions are included. Third-asset fees (for example BNB) are stored in the fill ledger but are not converted to USDT, as with the existing trade summaries. Each buy uses the smaller of budget cash and exchange free cash, multiplied by `BOT_POSITION_FRACTION`, capped by `BOT_MAX_ORDER_QUOTE`, with cash headroom for `BOT_FEE_RATE`. Orders below the minimum notional are skipped. The budget may grow or shrink with trading results; it is not a fixed equity ceiling.
+
+Restarts never refill the allocation. Once initialized, keep the same `BOT_TESTNET_BUDGET` value: changing or removing it fails startup instead of silently resetting losses. Existing daily risk halts remain active. Old trades and equity history are retained, while the dashboard equity chart and headline P&L start at budget activation. The historical trade ledger retains its original trade cost bases.
+
+The dashboard continues to run locally and reads the budget from the Linode API over the SSH tunnel. It does not enforce spending itself. See [the Linode runbook](deploy/README.md#enable-a-100-usdt-budget-on-an-existing-deployment) for upgrade commands.
 
 ### Telegram operational alerts
 

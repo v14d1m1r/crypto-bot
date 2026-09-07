@@ -95,6 +95,22 @@ async fn health(State(state): State<SharedState>) -> (StatusCode, Json<Value>) {
 async fn status(State(state): State<SharedState>) -> ApiResult {
     let status = state.database.status().await.map_err(internal)?;
     let environment = state.config.mode.to_string();
+    let budget = if environment == "testnet" {
+        state
+            .database
+            .budget(&state.config.symbol)
+            .await
+            .map_err(internal)?
+    } else {
+        None
+    };
+    let starting_cash = match &budget {
+        Some(budget) => budget
+            .capital
+            .parse::<f64>()
+            .map_err(|error| internal(error.into()))?,
+        None => state.config.starting_cash,
+    };
     let risk = state
         .database
         .risk_status(&environment, &state.config.symbol)
@@ -103,9 +119,12 @@ async fn status(State(state): State<SharedState>) -> ApiResult {
     Ok(Json(json!({
         "bot": status,
         "risk": risk,
+        "budget": budget.as_ref().map(|budget| json!({"initial_equity": starting_cash, "started_at": budget.started_at})),
         "config": { "symbol": state.config.symbol, "interval": state.config.interval,
             "fast_ema": state.config.fast_ema, "slow_ema": state.config.slow_ema,
-            "starting_cash": state.config.starting_cash, "mode": environment,
+            "starting_cash": starting_cash, "mode": environment,
+            "position_fraction": state.config.position_fraction,
+            "max_order_quote": state.config.max_order_quote,
             "max_daily_loss_quote": state.config.max_daily_loss_quote,
             "max_entries_per_day": state.config.max_entries_per_day,
             "max_consecutive_losses": state.config.max_consecutive_losses }
@@ -129,6 +148,22 @@ async fn fills(State(state): State<SharedState>) -> ApiResult {
 }
 
 async fn equity(State(state): State<SharedState>) -> ApiResult {
+    if state.config.mode == crate::config::ExecutionMode::Testnet
+        && state
+            .database
+            .budget(&state.config.symbol)
+            .await
+            .map_err(internal)?
+            .is_some()
+    {
+        return Ok(Json(json!(
+            state
+                .database
+                .budget_equity(&state.config.symbol, 200)
+                .await
+                .map_err(internal)?
+        )));
+    }
     Ok(Json(json!(
         state.database.recent_equity(200).await.map_err(internal)?
     )))
@@ -158,6 +193,62 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64
+    }
+
+    #[tokio::test]
+    async fn budget_status_and_chart_use_persisted_allocation() {
+        use crate::{config::ExecutionMode, trader::TraderState};
+        use rust_decimal::Decimal;
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        database
+            .save_state(
+                1,
+                TraderState {
+                    cash: 10000.0,
+                    position_quantity: None,
+                    entry_price: None,
+                },
+                100.0,
+                10000.0,
+            )
+            .await
+            .unwrap();
+        database
+            .initialize_budget(
+                "BTCUSDT",
+                Decimal::from(100),
+                Decimal::ZERO,
+                Decimal::from(100),
+                Decimal::ZERO,
+                2,
+            )
+            .await
+            .unwrap();
+        database
+            .save_state(
+                3,
+                TraderState {
+                    cash: 100.0,
+                    position_quantity: None,
+                    entry_price: None,
+                },
+                100.0,
+                100.0,
+            )
+            .await
+            .unwrap();
+        let mut config = Config::default_for_test();
+        config.mode = ExecutionMode::Testnet;
+        config.starting_cash = 10000.0;
+        config.testnet_budget = Some(100.0);
+        let state = Arc::new(ApiState { database, config });
+        let body = status(State(state.clone())).await.unwrap().0;
+        assert_eq!(body["config"]["starting_cash"], 100.0);
+        assert_eq!(body["budget"]["initial_equity"], 100.0);
+        assert_eq!(body["bot"]["equity"], 100.0);
+        let chart = equity(State(state)).await.unwrap().0;
+        assert_eq!(chart.as_array().unwrap().len(), 1);
+        assert_eq!(chart[0]["equity"], 100.0);
     }
 
     #[tokio::test]
